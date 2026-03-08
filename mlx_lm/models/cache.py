@@ -112,9 +112,11 @@ def trim_prompt_cache(cache: List[Any], num_tokens: int) -> List[Any]:
 def create_attention_mask(
     N: int, offset: int, return_array: bool, window_size: Optional[int]
 ):
-    if N == 1:
+    if window_size is not None:
+        return create_causal_mask(N, offset, window_size=window_size)
+    elif N == 1:
         return None
-    if return_array:
+    elif return_array:
         return create_causal_mask(N, offset, window_size=window_size)
     else:
         return "causal"
@@ -150,6 +152,11 @@ class _BaseCache:
         will always be 0 (though the cache may not be empty).
         """
         return 0
+
+    @property
+    def nbytes(self):
+        """Return the size of this cache in bytes"""
+        raise NotImplementedError("Cache sub-class must implement nbytes")
 
     def empty(self):
         """
@@ -212,6 +219,12 @@ class ConcatenateKVCache(_BaseCache):
 
     def empty(self):
         return self.keys is None
+
+    @property
+    def nbytes(self):
+        if self.keys is None:
+            return 0
+        return self.keys.nbytes + self.values.nbytes
 
 
 class QuantizedKVCache(_BaseCache):
@@ -302,6 +315,10 @@ class QuantizedKVCache(_BaseCache):
     def empty(self):
         return self.keys is None
 
+    @property
+    def nbytes(self):
+        return tree_reduce(lambda a, x: a + x.nbytes, (self.keys, self.values), 0)
+
 
 class KVCache(_BaseCache):
     step = 256
@@ -380,6 +397,12 @@ class KVCache(_BaseCache):
 
     def empty(self):
         return self.keys is None
+
+    @property
+    def nbytes(self):
+        if self.keys is None:
+            return 0
+        return self.keys.nbytes + self.values.nbytes
 
 
 class RotatingKVCache(_BaseCache):
@@ -559,6 +582,12 @@ class RotatingKVCache(_BaseCache):
     def empty(self):
         return self.keys is None
 
+    @property
+    def nbytes(self):
+        if self.keys is None:
+            return 0
+        return self.keys.nbytes + self.values.nbytes
+
 
 class ArraysCache(_BaseCache):
     def __new__(cls, *args, **kwargs):
@@ -645,10 +674,9 @@ class ArraysCache(_BaseCache):
     def empty(self):
         return self.cache[0] is None
 
-
-class MambaCache(ArraysCache):
-    def __init__(self, left_padding: Optional[List[int]] = None):
-        super().__init__(size=2, left_padding=left_padding)
+    @property
+    def nbytes(self):
+        return sum(c.nbytes for c in self.cache if c is not None)
 
 
 class ChunkedKVCache(_BaseCache):
@@ -727,6 +755,12 @@ class ChunkedKVCache(_BaseCache):
     def empty(self):
         return self.keys is None
 
+    @property
+    def nbytes(self):
+        if self.keys is None:
+            return 0
+        return self.keys.nbytes + self.values.nbytes
+
 
 class CacheList(_BaseCache):
     def __init__(self, *caches):
@@ -745,16 +779,24 @@ class CacheList(_BaseCache):
 
     @property
     def state(self):
-        return [s for c in self.caches for s in c.state]
+        return [c.state for c in self.caches]
 
     @state.setter
     def state(self, v):
-        state_lens = [len(c.state) for c in self.caches]
-        start = 0
-        for c in self.caches:
-            l = len(c.state)
-            c.state = v[start : start + l]
-            start += l
+        for c, s in zip(self.caches, v):
+            c.state = s
+
+    @property
+    def meta_state(self):
+        return (
+            [type(c).__name__ for c in self.caches],
+            [c.meta_state for c in self.caches],
+        )
+
+    @meta_state.setter
+    def meta_state(self, v):
+        for c, m in zip(self.caches, v[1]):
+            c.meta_state = m
 
     def filter(self, batch_indices):
         """
@@ -795,6 +837,18 @@ class CacheList(_BaseCache):
 
     def empty(self):
         return self.caches[0].empty()
+
+    @property
+    def nbytes(self):
+        return sum(c.nbytes for c in self.caches)
+
+    @classmethod
+    def from_state(cls, state, meta_state):
+        obj = cls.__new__(cls)
+        obj.caches = [
+            globals()[c].from_state(s, m) for s, c, m in zip(state, *meta_state)
+        ]
+        return obj
 
 
 def dynamic_roll(x, shifts, axis):
@@ -993,6 +1047,12 @@ class BatchKVCache(_BaseCache):
 
     def empty(self):
         return self.keys is None
+
+    @property
+    def nbytes(self):
+        if self.keys is None:
+            return 0
+        return self.keys.nbytes + self.values.nbytes
 
 
 class BatchRotatingKVCache(_BaseCache):
@@ -1308,3 +1368,9 @@ class BatchRotatingKVCache(_BaseCache):
 
     def empty(self):
         return self.keys is None
+
+    @property
+    def nbytes(self):
+        if self.keys is None:
+            return 0
+        return self.keys.nbytes + self.values.nbytes

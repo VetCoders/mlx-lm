@@ -883,7 +883,7 @@ class Batch:
         return [c.extract(idx) for c in self.cache]
 
 
-def _make_cache(model, left_padding):
+def _make_cache(model, left_padding, max_kv_size):
     """
     Convert a list of regular caches into their corresponding
     batch-aware caches.
@@ -908,6 +908,10 @@ def _make_cache(model, left_padding):
         cache = model.make_cache()
         return [to_batch_cache(c) for c in cache]
     else:
+        if max_kv_size is not None:
+            return [
+                BatchRotatingKVCache(max_kv_size, left_padding) for _ in model.layers
+            ]
         return [BatchKVCache(left_padding) for _ in model.layers]
 
 
@@ -947,6 +951,7 @@ class BatchGenerator:
         prompt_progress_callback: Optional[
             Callable[[List[Tuple[int, int, int]]], None]
         ] = None,
+        max_kv_size: Optional[int] = None,
     ):
         self.model = model
         self.unprocessed_prompts = []
@@ -960,6 +965,8 @@ class BatchGenerator:
         self.completion_batch_size = max(completion_batch_size, prefill_batch_size)
         self.prompt_progress_callback = prompt_progress_callback or (lambda *_: None)
         self._stats = BatchStats()
+        self._next_count = 0
+        self.max_kv_size = max_kv_size
 
         self.active_batch = None
 
@@ -1037,6 +1044,13 @@ class BatchGenerator:
         if return_prompt_caches:
             return caches
 
+    @property
+    def prompt_cache_nbytes(self):
+        total = sum(c.nbytes for p in self.unprocessed_prompts for c in p[3])
+        if self.active_batch is not None:
+            total += sum(c.nbytes for c in self.active_batch.cache)
+        return total
+
     def _process_prompts(self, prompts):
         uids, inputs, max_tokens, caches, samplers, logits_processors = zip(*prompts)
 
@@ -1054,7 +1068,7 @@ class BatchGenerator:
         #   2. Process
         if all(c[0].empty() for c in caches):
             inputs = _left_pad_prompts(inputs, max_length=max_length)
-            prompt_cache = _make_cache(self.model, padding)
+            prompt_cache = _make_cache(self.model, padding, self.max_kv_size)
 
             while inputs.shape[1] > 1:
                 n_to_process = min(self.prefill_step_size, inputs.shape[1] - 1)
@@ -1068,6 +1082,7 @@ class BatchGenerator:
                         for uid, length in zip(uids, lengths)
                     ]
                 )
+                mx.clear_cache()
 
         # Further prompt processing so we need to
         #   1. Merge the KV caches and prepare for right padded prompts
@@ -1214,7 +1229,7 @@ class BatchGenerator:
             batch.tokens,
         )
 
-        mx.async_eval(batch.y, batch.logprobs)
+        mx.async_eval(batch.y, batch.logprobs, batch.tokens)
 
         y = y.tolist()
         toc = time.perf_counter()
@@ -1252,6 +1267,9 @@ class BatchGenerator:
             else:
                 self.active_batch = None
 
+        self._next_count += 1
+        if self._next_count % 512 == 0:
+            mx.clear_cache()
         self._stats.generation_tokens += len(responses)
         return responses
 
