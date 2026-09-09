@@ -31,16 +31,22 @@ class TestSharedCacheContract(unittest.TestCase):
 
     def assert_history(self, cache, expected):
         self.assert_array(cache.keys[..., : cache.offset, :].reshape(-1), expected)
-        self.assert_array(cache.values[..., : cache.offset, :].reshape(-1),
-                          [v + 100 for v in expected])
+        self.assert_array(
+            cache.values[..., : cache.offset, :].reshape(-1),
+            [v + 100 for v in expected],
+        )
 
     def test_kv_extract_copies_each_row_and_logical_history(self):
         source = KVCache()
         x = history([[11, 12, 13], [21, 22, 23]])
         source.update_and_fetch(x, x + 100)
         source.trim(1)
-        for index, expected in [(0, [11, 12]), (1, [21, 22]),
-                                (-1, [21, 22]), (-2, [11, 12])]:
+        for index, expected in [
+            (0, [11, 12]),
+            (1, [21, 22]),
+            (-1, [21, 22]),
+            (-2, [11, 12]),
+        ]:
             with self.subTest(index=index):
                 row = source.extract(index)
                 self.assertIs(type(row), KVCache)
@@ -99,8 +105,9 @@ class TestSharedCacheContract(unittest.TestCase):
                 self.assertEqual(joined.batch_size, 2)
                 self.assert_array(joined.left_padding, [2, 1])
                 self.assert_array(joined.lengths, [5, 6])
-                self.assert_array(joined.make_mask(3), [[False, False, True],
-                                                       [False, True, True]])
+                self.assert_array(
+                    joined.make_mask(3), [[False, False, True], [False, True, True]]
+                )
                 extended = last.extract(0)
                 extended.extend(first)
                 self.assert_array(extended.left_padding, [2, 1])
@@ -136,8 +143,9 @@ class TestSharedCacheContract(unittest.TestCase):
         self.assert_array(row.lengths, [7])
         joined = ArraysCache.merge([row, lengths_only.extract(0)])
         self.assertIsNone(joined.left_padding)
-        self.assert_array(joined.make_mask(5), [[True] * 5,
-                                              [True, True, True, False, False]])
+        self.assert_array(
+            joined.make_mask(5), [[True] * 5, [True, True, True, False, False]]
+        )
         self.assertIsInstance(joined.state, list)
         self.assertEqual(len(joined.state), 2)
 
@@ -201,11 +209,12 @@ class TestSharedCacheContract(unittest.TestCase):
         self.assert_array(merged.extract(0).keys.reshape(-1), [7, 8, 9])
 
     def test_prefix_roundtrip_old_metadata_and_caller_detachment(self):
-        for cache, fresh in [(KVCache(), KVCache()),
-                             (RotatingKVCache(4), RotatingKVCache(4)),
-                             (BatchKVCache([0]), BatchKVCache([0])),
-                             (BatchRotatingKVCache(4, [0]),
-                              BatchRotatingKVCache(4, [0]))]:
+        for cache, fresh in [
+            (KVCache(), KVCache()),
+            (RotatingKVCache(4), RotatingKVCache(4)),
+            (BatchKVCache([0]), BatchKVCache([0])),
+            (BatchRotatingKVCache(4, [0]), BatchRotatingKVCache(4, [0])),
+        ]:
             with self.subTest(kind=type(cache).__name__):
                 x = history([[1, 2]])
                 cache.update_and_fetch(x, x + 100)
@@ -232,23 +241,41 @@ class TestSharedCacheContract(unittest.TestCase):
             with self.subTest(bits=bits):
                 cache = QuantizedKVCache(group_size=32, bits=bits)
                 self.assertEqual(cache.dequantize_for_apc(), (None, None))
-                # Endpoints 0/1 and 2/3 are exactly representable in affine groups.
-                keys = mx.tile(mx.array([0., 1.]), 48).reshape(1, 1, 3, 32)
+                # The affine endpoints are recovered within float32 rounding.
+                keys = mx.tile(mx.array([0.0, 1.0]), 48).reshape(1, 1, 3, 32)
                 values = keys + 2
                 cache.update_and_fetch(keys, values)
                 cache.trim(1)
                 snapshot = copy.deepcopy(cache.prefix_cache_snapshot())
                 restored = QuantizedKVCache()
                 restored.prefix_cache_restore(snapshot)
-                self.assertEqual(restored.meta_state, ('2', '32', str(bits)))
+                self.assertEqual(restored.meta_state, ("2", "32", str(bits)))
                 self.assertEqual(len(restored.state), 2)
                 k, v = restored.dequantize_for_apc()
                 self.assertEqual(k.shape, (1, 1, 2, 32))
-                self.assertTrue(mx.allclose(k, keys[:, :, :2]).item())
-                self.assertTrue(mx.allclose(v, values[:, :, :2]).item())
+                direct_k = mx.dequantize(
+                    *mx.quantize(keys[:, :, :2], group_size=32, bits=bits),
+                    group_size=32,
+                    bits=bits,
+                )
+                direct_v = mx.dequantize(
+                    *mx.quantize(values[:, :, :2], group_size=32, bits=bits),
+                    group_size=32,
+                    bits=bits,
+                )
+                self.assertTrue(mx.array_equal(k, direct_k).item())
+                self.assertTrue(mx.array_equal(v, direct_v).item())
+                self.assertTrue(mx.all(mx.isfinite(k)).item())
+                self.assertTrue(mx.all(mx.isfinite(v)).item())
+                self.assertTrue(
+                    mx.allclose(k, keys[:, :, :2], rtol=1e-5, atol=1e-6).item()
+                )
+                self.assertTrue(
+                    mx.allclose(v, values[:, :, :2], rtol=1e-5, atol=1e-6).item()
+                )
                 restored.trim(2)
                 self.assertEqual(restored.dequantize_for_apc(), (None, None))
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     unittest.main()

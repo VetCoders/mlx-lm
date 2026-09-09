@@ -463,8 +463,8 @@ class KVCache(_BaseCache):
                 f"KVCache row index {idx} out of range for batch size {batch_size}"
             )
 
-        cache.keys = self.keys[idx : idx + 1, :, : self.offset, :].copy()
-        cache.values = self.values[idx : idx + 1, :, : self.offset, :].copy()
+        cache.keys = copy.copy(self.keys[idx : idx + 1, :, : self.offset, :])
+        cache.values = copy.copy(self.values[idx : idx + 1, :, : self.offset, :])
         cache.offset = self.offset
         return cache
 
@@ -757,12 +757,12 @@ class ArraysCache(_BaseCache):
 
         cache = ArraysCache(len(self.cache))
         cache.cache = [
-            None if c is None else c[idx : idx + 1].copy() for c in self.cache
+            None if c is None else copy.copy(c[idx : idx + 1]) for c in self.cache
         ]
         if self.left_padding is not None:
-            cache.left_padding = self.left_padding[idx : idx + 1].copy()
+            cache.left_padding = copy.copy(self.left_padding[idx : idx + 1])
         if self.lengths is not None:
-            cache.lengths = self.lengths[idx : idx + 1].copy()
+            cache.lengths = copy.copy(self.lengths[idx : idx + 1])
         return cache
 
     def prepare(self, lengths=None, **kwargs):
