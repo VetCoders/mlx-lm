@@ -75,11 +75,12 @@ def load_prompt_cache(file_name, return_metadata=False):
     arrays, cache_metadata = mx.load(file_name, return_metadata=True)
     arrays = tree_unflatten(list(arrays.items()))
     cache_metadata = tree_unflatten(list(cache_metadata.items()))
+    if not isinstance(cache_metadata, (list, tuple)) or len(cache_metadata) != 3:
+        raise ValueError(
+            "Prompt cache metadata must contain info, metadata and classes"
+        )
     info, metadata, classes = cache_metadata
-    cache = [
-        globals()[c].from_state(state, meta_state)
-        for c, state, meta_state in zip(classes, arrays, info)
-    ]
+    cache = _decode_cache_states(arrays, classes, info)
     if return_metadata:
         return cache, metadata
     return cache
@@ -197,6 +198,72 @@ class _BaseCache:
         return None
 
 
+_REGISTERED_CACHE_TYPES = {}
+
+
+def register_cache_type(cache_type):
+    """Register a specialized raw-state codec under its class name.
+
+    Only proper _BaseCache subclasses with callable from_state are accepted.
+    Builtin and module-global names are reserved, and a different type cannot
+    reuse a registered name. Registering the same exact type again is a no-op.
+    Registration does not import modules or change canonical cache identities.
+    """
+    if (
+        not isinstance(cache_type, type)
+        or cache_type is _BaseCache
+        or not issubclass(cache_type, _BaseCache)
+        or not callable(getattr(cache_type, "from_state", None))
+    ):
+        raise TypeError(
+            "Cache type must be a _BaseCache subclass with callable from_state"
+        )
+    name = cache_type.__name__
+    builtins = __builtins__ if isinstance(__builtins__, dict) else vars(__builtins__)
+    if name in globals() or name in builtins:
+        raise ValueError(f"Cache type name is reserved: {name!r}")
+    if name in _REGISTERED_CACHE_TYPES:
+        if _REGISTERED_CACHE_TYPES[name] is cache_type:
+            return
+        raise ValueError(f"Cache type name is already registered: {name!r}")
+    _REGISTERED_CACHE_TYPES[name] = cache_type
+
+
+def _resolve_cache_type(name):
+    # Keep the canonical codec set explicit: other globals are not decoders.
+    canonical = (
+        _BaseCache,
+        ConcatenateKVCache,
+        QuantizedKVCache,
+        KVCache,
+        RotatingKVCache,
+        ArraysCache,
+        ChunkedKVCache,
+        CacheList,
+        BatchKVCache,
+        BatchRotatingKVCache,
+    )
+    if not isinstance(name, str):
+        raise ValueError("Cache type name must be a string")
+    for cache_type in canonical:
+        if name == cache_type.__name__:
+            return cache_type
+    if name in _REGISTERED_CACHE_TYPES:
+        return _REGISTERED_CACHE_TYPES[name]
+    raise ValueError(f"Unknown cache type: {name!r}")
+
+
+def _decode_cache_states(state, classes, metadata):
+    if not all(isinstance(v, (list, tuple)) for v in (state, classes, metadata)):
+        raise ValueError("Cache state, classes and metadata must be parallel sequences")
+    if not len(state) == len(classes) == len(metadata):
+        raise ValueError("Cache state, classes and metadata must have equal lengths")
+    decoders = [_resolve_cache_type(name) for name in classes]
+    return [
+        decoder.from_state(s, m) for decoder, s, m in zip(decoders, state, metadata)
+    ]
+
+
 class ConcatenateKVCache(_BaseCache):
     """ConcatenateKVCache the simplest KV cache implementation.
 
@@ -228,7 +295,7 @@ class ConcatenateKVCache(_BaseCache):
     @state.setter
     def state(self, v):
         self.keys, self.values = v
-        self.offset = self.keys.shape[-2]
+        self.offset = 0 if self.keys is None else self.keys.shape[-2]
 
     def is_trimmable(self):
         return True
@@ -236,6 +303,9 @@ class ConcatenateKVCache(_BaseCache):
     def trim(self, n):
         n = min(self.offset, n)
         self.offset -= n
+        if self.keys is not None:
+            self.keys = self.keys[..., : self.offset, :]
+            self.values = self.values[..., : self.offset, :]
         return n
 
     def make_mask(self, *args, **kwargs):
@@ -1001,10 +1071,12 @@ class CacheList(_BaseCache):
 
     @classmethod
     def from_state(cls, state, meta_state):
+        if not isinstance(meta_state, (list, tuple)) or len(meta_state) != 2:
+            raise ValueError("CacheList metadata must contain classes and metadata")
+        classes, metadata = meta_state
+        caches = _decode_cache_states(state, classes, metadata)
         obj = cls.__new__(cls)
-        obj.caches = [
-            globals()[c].from_state(s, m) for s, c, m in zip(state, *meta_state)
-        ]
+        obj.caches = caches
         return obj
 
 
